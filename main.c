@@ -5,12 +5,18 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netinet/ip.h>
 
 #define IPBUF_LEN 16
 #define DEF_PKT_LEN 60
 #define MIN_PKT_LEN 28
 #define MAX_PKT_LEN 65000
 #define HDR_IPV4_LEN 20
+#define PKT_LBUF 64
+
+#define FD_SEND 0
+#define FD_RECV 1
+#define LFDS 2
 
 #define STACK_INIT 1
 
@@ -34,6 +40,8 @@
                     "       packetlen   The full packet length (default is the length of an IP\n" \
                     "                   header plus 40). Can be ignored or increased to a minimal\n" \
                     "                   allowed value\n");
+#define ERR_SUDO(u) \
+    fprintf(stderr, "uid `%d` is not 0\n", u);  
 #define ERR_TO_BIG_IPV4(s) \
     fprintf(stderr, "too big ipv4 `%s` specified\n", s)
 #define ERR_TOO_BIG_PKT(s) \
@@ -44,31 +52,21 @@
     fprintf(stderr, "Cannot handle \"packetlen\" cmdline arg `%s` on position %d (argc %d)\n", s, n, n);
 #define INVALID_IPV4(s) \
     fprintf(stderr, "Not a IPv4 address `%s`\n", s);
-#define INVALID_HDR_SIZE(n) \
-    fprintf(stderr, "Malformation of IP header size `%d`\n", n);
-#define CREATION_SOCKET_FAILED \
-    fprintf(stderr, "Socket creation failed\n");
+#define CREATION_SOCKET_SEND_FAILED \
+    fprintf(stderr, "Socket send creation failed\n");
+#define CREATION_SOCKET_RECV_FAILED \
+    fprintf(stderr, "Socket recv creation failed\n")
 #define BINDING_SOCKET_FAILED \
     fprintf(stderr, "Socket binding failed\n");
+#define SENDTO_FAILED \
+    fprintf(stderr, "sendto failed\n");
+#define RECVFROM_FAILED \
+    fprintf(stderr, "recvfrom failed\n");
 
 typedef struct s_in {
     struct sockaddr_in ipv4[STACK_INIT];
-    size_t pkt_len;
+    int pkt_len;
 } t_in;
-
-typedef struct __attribute__((packed)) {
-    uint8_t version : 4; // IPV4
-	uint8_t header_len : 4;
-	uint8_t type_service;
-	uint16_t total_len;
-    uint16_t id;
-	uint16_t fragment_offset;
-    uint8_t ttl;
-    uint8_t protocol;
-    uint16_t protocol_checksum;
-    uint32_t src_addr;
-    uint32_t dst_addr;
-} t_ip_pkt;
 
 /* traceroute <ip> <size> */
 
@@ -113,7 +111,7 @@ parse_args(size_t n_args, char **args, t_in *in) {
     }
     if (n_args == 2) {
         in->pkt_len = atoi(args[1]);
-        if (in->pkt_len == ATOI_ERROR) {
+        if (in->pkt_len <= ATOI_ERROR) {
             ERR_HANDLE_PKT_LEN(args[1], MAX_PARSING - 1)
             return WRONG;
         }
@@ -125,33 +123,67 @@ parse_args(size_t n_args, char **args, t_in *in) {
 }
 
 int
-build_pkt(t_in *in, t_ip_pkt *pkt) {
-    if (sizeof(t_ip_pkt) != HDR_IPV4_LEN) {
-        INVALID_HDR_SIZE((int)sizeof(t_ip_pkt));
-        return WRONG;
-    }
-    pkt->dst_addr = ntohl(in->ipv4->sin_addr.s_addr);
-    pkt->ttl = 0;
-    pkt->version >> 4;
+build_pkt(t_in *in, void *buf, size_t lbuf) {
+    memset(buf, 0, lbuf);
+    struct iphdr *ip = (struct iphdr *)buf;
+    ip->daddr = ntohl(in->ipv4->sin_addr.s_addr);
+    ip->version = 4;
+    ip->ihl = 5;
+    ip->protocol = IPPROTO_UDP;
+    ip->ttl = 0;
     return CORRECT;
 }
 
-int opn_sock(t_in *in) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        CREATION_SOCKET_FAILED;
+void close_fds(int *fd) {
+    for (size_t i = 0; i < 2; i++) {
+        if (fd[i] != -1) {
+            close(fd[i]);
+        }
+    }
+}
+
+int opn_sock(t_in *in, int *fds) {
+    fds[FD_SEND] = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fds[FD_SEND] < 0) {
+        CREATION_SOCKET_SEND_FAILED;
         return WRONG;
     }
-    if (bind(fd, (const struct sockaddr*)&in->ipv4, sizeof(in->ipv4)) < 0) {
-        close(fd);
-        BINDING_SOCKET_FAILED;
+    fds[FD_RECV] = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (fds[FD_RECV] < 0) {
+        CREATION_SOCKET_RECV_FAILED;
         return WRONG;
     }
-    return fd;
+    return CORRECT;
+}
+
+int send_pkt(int *fds, t_in *in, void *buf, size_t lbuf) {
+    ssize_t r = sendto(fds[FD_SEND], buf, lbuf, 0, (const struct sockaddr*)&in->ipv4->sin_addr.s_addr, sizeof(in->ipv4));
+    if (r < 0) {
+        close_fds(fds);
+        SENDTO_FAILED;
+        return (WRONG);
+    }
+    return (CORRECT);
+}
+
+int recv_pkt(int *fds, t_in *in, void *buf, size_t lbuf) {
+    socklen_t l = sizeof(in->ipv4);
+    ssize_t r = recvfrom(fds[FD_RECV], buf, lbuf, 0, (struct sockaddr*)&in->ipv4->sin_addr.s_addr, &l);
+    if (r < 0) {
+        close_fds(fds);
+        RECVFROM_FAILED;
+        return (WRONG);
+    }
+    return (CORRECT);
 }
 
 int 
 main(int n_args, char **args) {
+    uid_t uid = getuid();
+    if (uid != 0) {
+        ERR_SUDO(uid);
+        return WRONG;
+    }
     t_in in[STACK_INIT];
     init(in);
     if (n_args == MIN_PARSING) {
@@ -161,9 +193,21 @@ main(int n_args, char **args) {
     if (parse_args((size_t)n_args - 1, args + 1, in) == WRONG) {
         return WRONG;
     }
-    t_ip_pkt pkt[STACK_INIT];
-    if (build_pkt(in, pkt) == WRONG) {
+    uint8_t sdr_buf[PKT_LBUF];
+    if (build_pkt(in, sdr_buf, sizeof(sdr_buf)) == WRONG) {
         return WRONG;
     }
+    int fds[LFDS] = {-1, -1};
+    if (opn_sock(in, fds) == WRONG) {
+        return WRONG;
+    }
+    if (send_pkt(fds, in, sdr_buf, sizeof(sdr_buf)) == WRONG) {
+        return WRONG;
+    }
+    uint8_t rcv_buf[PKT_LBUF];
+    if (recv_pkt(fds, in, rcv_buf, sizeof(rcv_buf)) == WRONG) {
+        return WRONG;
+    }
+    close_fds(fds);
     return CORRECT;
 }
