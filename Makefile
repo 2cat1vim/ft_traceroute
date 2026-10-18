@@ -1,7 +1,9 @@
 NAME = ft_traceroute
 CC = cc
 CFLAGS = -g -Wall -Wextra -Werror 
-SRC = main.c
+SRC = srcs/main.c \
+	  srcs/inet.c \
+	  srcs/utility.c
 
 OBJS = $(SRC:.c=.o)
 
