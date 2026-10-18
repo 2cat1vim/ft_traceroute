@@ -18,8 +18,8 @@
 #define PKT_LBUF 64
 
 #define UDP_PORT 33434
-#define MAX_TTL 64
-#define PROBES_PER_HOPE 3
+#define MAX_TTL 30
+#define HOPE 3
 
 #define FD_SEND 0
 #define FD_RECV 1
@@ -73,7 +73,8 @@
     fprintf(stderr, "Recvfrom timeout `%s`\n", s);
 #define SELECT_FAILED \
     fprintf(stderr, "Select failed\n");
-
+#define TTL_FAILED \
+    fprintf(stderr, "TTL failed\n");
 
 typedef struct s_in {
     struct sockaddr_in iaddr[STACK_INIT];
@@ -128,7 +129,7 @@ get_addr(t_in *in)
     
     in->laddr = res->ai_addrlen;
     memcpy(in->iaddr, res->ai_addr, sizeof(struct sockaddr_in));
-    in->iaddr->sin_port = htons(UDP_PORT + (MAX_TTL * PROBES_PER_HOPE - 1));
+    in->iaddr->sin_port = htons(UDP_PORT + (MAX_TTL * HOPE - 1));
     inet_ntop(AF_INET, &(in->iaddr->sin_addr), in->saddr, in->laddr);
     freeaddrinfo(res);
     return CORRECT;
@@ -224,12 +225,102 @@ send_pkt(int *fds, t_in *in, void *buf, size_t lbuf) {
     return (CORRECT);
 }
 
+/*
+** TTL AND PROBES IN TRACEROUTE
+**
+** TTL:
+**     - Limits how many router hops a packet can traverse.
+**     - Each router decrements TTL by 1.
+**     - When TTL reaches 0, the router drops the packet and
+**       usually sends ICMP Time Exceeded (Type 11, Code 0).
+**
+** PROBES:
+**     - Each probe is a separate UDP packet.
+**     - We send multiple probes per TTL (usually 3).
+**     - All probes for the same hop use the same TTL.
+**
+** HOW IT WORKS:
+**     TTL = 1 -> first router responds with ICMP.
+**     TTL = 2 -> second router responds with ICMP.
+**     TTL = 3 -> third router responds with ICMP.
+**     ...
+**
+**     Each new TTL discovers the next hop.
+**
+** IMPORTANT:
+**     - Our program sets the initial TTL using setsockopt().
+**     - Routers decrement TTL automatically.
+**     - We continue until the destination responds or MAX_TTL
+**       is reached.
+*/
+
+/*
+** ICMP REPLIES IN UDP TRACEROUTE (IPv4)
+**
+** ICMP Type 11, Code 0:
+**     Time Exceeded (TTL expired in transit).
+**     -> An intermediate router responded.
+**     -> Print the router's source IP and RTT.
+**     -> Continue to the next probe / TTL.
+**
+** ICMP Type 3, Code 3:
+**     Destination Unreachable (Port Unreachable).
+**     -> Usually means the UDP probe reached the destination.
+**     -> Verify that the reply matches our probe and comes from
+**        the target IP before considering the destination reached.
+**     -> Print the result and stop the traceroute.
+**
+** ICMP Type 3, Code 0:
+**     Network Unreachable.
+**     -> The destination network cannot be reached.
+**     -> Report the error; usually stop the traceroute.
+**
+** ICMP Type 3, Code 1:
+**     Host Unreachable.
+**     -> The destination host cannot be reached.
+**     -> Report the error; usually stop the traceroute.
+**
+** ICMP Type 3, Code 9, 10 or 13:
+**     Administratively prohibited (filtering).
+**     -> Report that the probe is blocked.
+**     -> Usually stop or mark the destination as unreachable.
+**
+** TIMEOUT:
+**     No valid response arrived before the timeout.
+**     -> Print '*' for this probe.
+**     -> Continue with the remaining probes and next TTL.
+**
+** OTHER ICMP RESPONSES:
+**     -> Interpret according to their type and code.
+**     -> Do not automatically treat them as success.
+**
+** STOP CONDITIONS:
+**     1. Destination reached and a valid response confirms it.
+**     2. A terminal network error is detected and handled.
+**     3. MAX_TTL is reached.
+**
+** IMPORTANT:
+**     - TTL starts at 1, not 0.
+**     - Set IP_TTL before sending probes for each hop.
+**     - Send PROBES_PER_HOP probes with the same TTL.
+**     - Read the outer IPv4 source IP to identify the responder.
+**     - Validate the ICMP response and match it to our probe.
+**     - A timeout does not mean the router does not exist.
+*/
+int handle_reply(struct iphdr *ip, struct icmphdr *icmp) {
+    (void)icmp;
+    char str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(ip->saddr), str, sizeof(str));
+    //printf("Reply addr: %s\n", str);
+    return CORRECT;
+}
+
 int 
-recv_pkt(int *fds, t_in *in, void *buf, size_t lbuf) {
+recv_pkt(int hope, int *fds, t_in *in, void *buf, size_t lbuf) {
     socklen_t l = sizeof(in->iaddr);
 
     fd_set rfds;
-    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
 
     FD_ZERO(&rfds);
     FD_SET(fds[1], &rfds);
@@ -239,20 +330,31 @@ recv_pkt(int *fds, t_in *in, void *buf, size_t lbuf) {
         SELECT_FAILED;
     }
     else if (ret == 0) {
-        RECVFROM_TIMEOUT(in->saddr);
+        write(STDOUT_FILENO, "*", 1);
+        if (hope < HOPE - 1) {
+            write(STDOUT_FILENO, " ", 1);
+        } else {
+            write(STDOUT_FILENO, "\n", 1);
+        }
+        return CORRECT;
     }
     else if (FD_ISSET(fds[1], &rfds)) {
-        ssize_t r = recvfrom(fds[FD_RECV], buf, lbuf, 0, (struct sockaddr*)&in->iaddr->sin_addr.s_addr, &l);
+        ssize_t r = recvfrom(
+            fds[FD_RECV],
+            buf,
+            lbuf,
+            0, 
+            (struct sockaddr*)&in->iaddr->sin_addr.s_addr, 
+            &l);
         if (r < 0) {
             close_fds(fds);
             RECVFROM_FAILED;
             return (WRONG);
         }
     }
+    struct iphdr *ip = (struct iphdr*)(buf);
     struct icmphdr *icmp = (struct icmphdr*)(buf);
-    char str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(icmp->un.gateway), str, sizeof(str));
-    printf("Reply gateway: %s\n", str);
+    handle_reply(ip, icmp);
     return (CORRECT);
 }
 
@@ -280,13 +382,21 @@ main(int n_args, char **args) {
     if (opn_sock(fds) == WRONG) {
         return WRONG;
     }
-    debug(in);
-    if (send_pkt(fds, in, sdr_buf, sizeof(sdr_buf)) == WRONG) {
-        return WRONG;
-    }
-    uint8_t rcv_buf[PKT_LBUF];
-    if (recv_pkt(fds, in, rcv_buf, sizeof(rcv_buf)) == WRONG) {
-        return WRONG;
+    for (int ttl = 1; ttl <= MAX_TTL; ttl++) {
+        if (setsockopt(fds[FD_SEND], IPPROTO_IP, IP_TTL,
+                   &ttl, sizeof(ttl)) == -1) {
+            TTL_FAILED;
+            return WRONG;
+        }
+        for (int hope = 0; hope < HOPE; hope++) {
+            if (send_pkt(fds, in, sdr_buf, sizeof(sdr_buf)) == WRONG) {
+                return WRONG;
+            }
+            uint8_t rcv_buf[PKT_LBUF];
+            if (recv_pkt(hope, fds, in, rcv_buf, sizeof(rcv_buf)) == WRONG) {
+                return WRONG;
+            }
+        }
     }
     close_fds(fds);
     return CORRECT;
