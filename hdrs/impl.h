@@ -22,7 +22,6 @@
 
 #define UDP_PORT 33434
 #define MAX_TTL 30
-#define MAX_HOPE 30
 #define HOPE 3
 
 #define FD_SEND 0
@@ -38,6 +37,7 @@
 
 #define CORRECT 0
 #define WRONG 1
+#define TIMEOUT 2
 
 #define ATOI_ERROR 0
 
@@ -86,7 +86,8 @@
 
 typedef struct s_in {
     struct sockaddr_in iaddr[STACK_INIT];
-    struct sockaddr_in my_iaddr[STACK_INIT];
+    in_port_t src_port;
+    in_port_t dst_port;
     size_t laddr;
     char saddr[IPBUF_LEN];
     int lpkt;
@@ -94,16 +95,15 @@ typedef struct s_in {
     int stop;
     char waiting_addr[INET_ADDRSTRLEN];
     char waiting_host[64];
-    int cat_hops;
 } t_in;
 
 int get_addr(t_in *in);
 int parse_args(size_t n_args, char **args, t_in *in);
 int build_pkt(t_in *in, void *buf, size_t lbuf);
-int  opn_sock(int *fds);
+int  opn_sock(int *fds, t_in *in);
 int send_pkt(int *fds, t_in *in, void *buf, size_t lbuf);
-void handle_reply(struct iphdr *ip, struct icmphdr *icmp, t_in *in);
-int recv_pkt(int hope, int *fds, t_in *in, void *buf, size_t lbuf);
+int handle_reply(const uint8_t *buf, size_t r, t_in *in);
+int recv_pkt(int *fds, t_in *in, void *buf, size_t lbuf);
 void close_fds(int *fd);
 void debug(t_in *in);
 

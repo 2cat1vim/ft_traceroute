@@ -9,13 +9,3 @@ close_fds(int *fd)
         }
     }
 }
-
-void 
-debug(t_in *in) 
-{
-    printf("iaddr->sin_addr.s_addr: %d\nladdr: %ld\nsaddr: %s\npkt_len: %d\n", 
-        in->iaddr->sin_addr.s_addr,
-        in->laddr,
-        in->saddr,
-        in->lpkt);
-}

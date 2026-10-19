@@ -1,30 +1,30 @@
+#define _GNU_SOURCE
 #include "../hdrs/impl.h"
 
 int
 get_addr(t_in *in)
 {
-    struct addrinfo hints, *res;
-    
+    struct addrinfo hints, *res = NULL;
+
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags |= AI_IDN;
 
-    if (getaddrinfo(in->saddr, NULL, &hints, &res)) {
+    if (getaddrinfo(in->saddr, NULL, &hints, &res) || res == NULL) {
         INVALID_IPV4(in->saddr);
         return WRONG;
     }
-    
-    in->laddr = res->ai_addrlen;
     memcpy(in->iaddr, res->ai_addr, sizeof(struct sockaddr_in));
-    in->iaddr->sin_port = htons(UDP_PORT + (MAX_TTL * HOPE - 1));
-    inet_ntop(AF_INET, &(in->iaddr->sin_addr), in->saddr, in->laddr);
+    in->iaddr->sin_port = htons(UDP_PORT);
+    in->dst_port = UDP_PORT;
+    inet_ntop(AF_INET, &(in->iaddr->sin_addr), in->saddr, sizeof(in->saddr));
     freeaddrinfo(res);
     return CORRECT;
 }
 
 int
-parse_args(size_t n_args, char **args,
-                             t_in *in) 
+parse_args(size_t n_args, char **args, t_in *in)
 {
     for (size_t i = 0; i < n_args; i++) {
         if (strcmp(args[i], HELP_FLAG) == CORRECT) {
@@ -40,31 +40,28 @@ parse_args(size_t n_args, char **args,
         ERR_TO_BIG_IPV4(args[0]);
         return WRONG;
     }
-    strncpy(in->saddr, args[0], INET_ADDRSTRLEN - 1);
+    snprintf(in->saddr, sizeof(in->saddr), "%s", args[0]);
     if (get_addr(in) == WRONG) {
         return WRONG;
     }
     if (n_args == 2) {
-        in->lpkt = atoi(args[1]);
-        if (in->lpkt <= ATOI_ERROR) {
-            ERR_HANDLE_PKT_LEN(args[1], MAX_PARSING - 1)
+        int v = atoi(args[1]);
+        if (v <= 0) {
+            ERR_HANDLE_PKT_LEN(args[1], MAX_PARSING - 1);
             return WRONG;
         }
-        if (in->lpkt < MIN_PKT_LEN) {
-            in->lpkt = MIN_PKT_LEN;
-        }
-        if (in->lpkt > MAX_PKT_LEN) {
-            in->lpkt = MAX_PKT_LEN;
-        }
+        if (v < MIN_PKT_LEN) v = MIN_PKT_LEN;
+        if (v > MAX_PKT_LEN) v = MAX_PKT_LEN;
+        in->lpkt = (int)v;
     }
     else {
-        in->lpkt = DEF_PKT_LEN; 
+        in->lpkt = DEF_PKT_LEN;
     }
     return CORRECT;
 }
 
-int 
-opn_sock(int *fds)
+int
+opn_sock(int *fds, t_in *in)
 {
     fds[FD_SEND] = socket(AF_INET, SOCK_DGRAM, 0);
     if (fds[FD_SEND] < 0) {
@@ -73,147 +70,109 @@ opn_sock(int *fds)
     }
     fds[FD_RECV] = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (fds[FD_RECV] < 0) {
+        close_fds(fds);
         CREATION_SOCKET_RECV_FAILED;
+        return WRONG;
+    }
+    struct sockaddr_in me;
+    socklen_t len = sizeof(me);
+    memset(&me, 0, sizeof(me));
+    me.sin_family = AF_INET;
+    if (bind(fds[FD_SEND], (struct sockaddr *)&me, sizeof(me)) < 0
+        || getsockname(fds[FD_SEND], (struct sockaddr *)&me, &len) < 0) {
+        close_fds(fds);
+        return WRONG;
+    }
+    in->src_port = me.sin_port;
+    return CORRECT;
+}
+
+int
+send_pkt(int *fds, t_in *in, void *buf, size_t lbuf)
+{
+    in->iaddr->sin_port = htons(in->dst_port);
+    ssize_t r = sendto(fds[FD_SEND], buf, lbuf, 0,
+                       (struct sockaddr *)in->iaddr,
+                       sizeof(struct sockaddr_in));
+    if (r < 0) {
+        close_fds(fds);
+        SENDTO_FAILED;
         return WRONG;
     }
     return CORRECT;
 }
 
-int 
-send_pkt(int *fds, t_in *in, 
-               void    *buf, 
-               size_t  lbuf)
+int
+handle_reply(const uint8_t *buf, size_t r, t_in *in)
 {
-    ssize_t r = sendto(fds[FD_SEND], buf, lbuf, 0,
-            (struct sockaddr*)&in->iaddr,
-            sizeof(struct sockaddr_in));
-    if (r < 0) {
-        close_fds(fds);
-        SENDTO_FAILED;
-        return (WRONG);
-    }
-    return (CORRECT);
-}
+    if (r < sizeof(struct iphdr))
+        return 0;
+    const struct iphdr *ip = (const struct iphdr *)buf;
+    size_t iplen = (size_t)ip->ihl * 4;
+    if (ip->protocol != IPPROTO_ICMP || iplen < sizeof(struct iphdr)
+        || r < iplen + sizeof(struct icmphdr) + sizeof(struct iphdr))
+        return 0;
 
-/*
-** ICMP REPLIES IN UDP TRACEROUTE (IPv4)
-**
-** ICMP Type 11, Code 0:
-**     Time Exceeded (TTL expired in transit).
-**     -> An intermediate router responded.
-**     -> Print the router's source IP and RTT.
-**     -> Continue to the next probe / TTL.
-**
-** ICMP Type 3, Code 3:
-**     Destination Unreachable (Port Unreachable).
-**     -> Usually means the UDP probe reached the destination.
-**     -> Verify that the reply matches our probe and comes from
-**        the target IP before considering the destination reached.
-**     -> Print the result and stop the traceroute.
-**
-** ICMP Type 3, Code 0:
-**     Network Unreachable.
-**     -> The destination network cannot be reached.
-**     -> Report the error; usually stop the traceroute.
-**
-** ICMP Type 3, Code 1:
-**     Host Unreachable.
-**     -> The destination host cannot be reached.
-**     -> Report the error; usually stop the traceroute.
-**
-** ICMP Type 3, Code 9, 10 or 13:
-**     Administratively prohibited (filtering).
-**     -> Report that the probe is blocked.
-**     -> Usually stop or mark the destination as unreachable.
-**
-** TIMEOUT:
-**     No valid response arrived before the timeout.
-**     -> Print '*' for this probe.
-**     -> Continue with the remaining probes and next TTL.
-**
-** OTHER ICMP RESPONSES:
-**     -> Interpret according to their type and code.
-**     -> Do not automatically treat them as success.
-**
-** STOP CONDITIONS:
-**     1. Destination reached and a valid response confirms it.
-**     2. A terminal network error is detected and handled.
-**     3. MAX_TTL is reached.
-**
-** IMPORTANT:
-**     - TTL starts at 1, not 0.
-**     - Set IP_TTL before sending probes for each hop.
-**     - Send PROBES_PER_HOP probes with the same TTL.
-**     - Read the outer IPv4 source IP to identify the responder.
-**     - Validate the ICMP response and match it to our probe.
-**     - A timeout does not mean the router does not exist.
-*/
-void 
-handle_reply(struct iphdr *ip, struct icmphdr *icmp, t_in *in)
-{
-    int ttl_exceeded = (icmp->type == 11 && icmp->code == 0);
-    int dest_unreach  = (icmp->type == 3 && (icmp->code == 3
-                                          || icmp->code == 1
-                                          || icmp->code == 0));
+    const struct icmphdr *icmp = (const struct icmphdr *)(buf + iplen);
+    int ttl_exceeded = (icmp->type == ICMP_TIME_EXCEEDED && icmp->code == 0);
+    int dest_unreach = (icmp->type == ICMP_DEST_UNREACH);
     if (!ttl_exceeded && !dest_unreach)
-        return ;
-    char tmp[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(ip->saddr), tmp, sizeof(tmp));
-    strcpy(in->waiting_addr, tmp);
+        return 0;
+
+    const struct iphdr *inner =
+        (const struct iphdr *)((const uint8_t *)icmp + sizeof(struct icmphdr));
+    size_t innerlen = (size_t)inner->ihl * 4;
+    if (innerlen < sizeof(struct iphdr)
+        || r < iplen + sizeof(struct icmphdr) + innerlen + sizeof(struct udphdr))
+        return 0;
+    if (inner->protocol != IPPROTO_UDP
+        || inner->daddr != in->iaddr->sin_addr.s_addr)
+        return 0;
+
+    const struct udphdr *udp =
+        (const struct udphdr *)((const uint8_t *)inner + innerlen);
+    if (udp->uh_sport != in->src_port || udp->uh_dport != htons(in->dst_port))
+        return 0;
+
+    inet_ntop(AF_INET, &ip->saddr, in->waiting_addr, sizeof(in->waiting_addr));
     struct hostent *host = gethostbyaddr(&ip->saddr, sizeof(ip->saddr), AF_INET);
-    if (!host) {
-        strcpy(in->waiting_host, tmp);
-    }
-    else {
-        strcpy(in->waiting_host, host->h_name);
-    }
-    if (dest_unreach) {
+    snprintf(in->waiting_host, sizeof(in->waiting_host), "%s",
+             host ? host->h_name : in->waiting_addr);
+    if (dest_unreach)
         in->stop = 1;
-    }
+    return 1;
 }
 
-int 
-recv_pkt(int hope, int *fds,
-                t_in    *in,
-                void    *buf,
-                size_t  lbuf)
+int
+recv_pkt(int *fds, t_in *in, void *buf, size_t lbuf)
 {
-    fd_set rfds;
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 25000 };
 
-    FD_ZERO(&rfds);
-    FD_SET(fds[1], &rfds);
+    in->waiting_addr[0] = '\0';
+    in->waiting_host[0] = '\0';
 
-    int ret = select(fds[1] + 1, &rfds, NULL, NULL, &tv);
-    if (ret < 0) {
-        SELECT_FAILED;
-    }
-    else if (ret == 0) {
-        in->cat_hops++;
-        if (in->cat_hops > MAX_HOPE) {
-            in->stop = 1;
-            return CORRECT;
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fds[FD_RECV], &rfds);
+
+        int ret = select(fds[FD_RECV] + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            close_fds(fds);
+            SELECT_FAILED;
+            return WRONG;
         }
-        if (hope == 0) {
-            fprintf(stdout, "%d * * *\n", in->ttl);
-        }
-    }
-    else if (FD_ISSET(fds[1], &rfds)) {
-        ssize_t r = recvfrom(
-            fds[FD_RECV],
-            buf,
-            lbuf,
-            0, 
-            NULL,
-            NULL);
+        if (ret == 0)
+            return TIMEOUT;
+
+        ssize_t r = recvfrom(fds[FD_RECV], buf, lbuf, 0, NULL, NULL);
         if (r < 0) {
             close_fds(fds);
             RECVFROM_FAILED;
-            return (WRONG);
+            return WRONG;
         }
+        if (handle_reply((const uint8_t *)buf, (size_t)r, in)) {
+            return CORRECT;
+        }       
     }
-    struct iphdr *ip = (struct iphdr*)(buf);
-    struct icmphdr *icmp = (struct icmphdr*)(buf + ip->ihl * 4);
-    handle_reply(ip, icmp, in);
-    return (CORRECT);
 }
