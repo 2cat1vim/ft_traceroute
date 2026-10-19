@@ -12,6 +12,8 @@ main(int n_args, char **args)
     memset(&in->iaddr, 0, sizeof(in->iaddr));
     in->iaddr->sin_family = AF_INET;
     in->lpkt = 0;
+    in->stop = 0;
+    in->cat_hops = 0;
     if (n_args == MIN_PARSING) {
         USAGE;
         return CORRECT;
@@ -37,12 +39,21 @@ main(int n_args, char **args)
             return WRONG;
         }
         for (int hope = 0; hope < HOPE; hope++) {
+            char last_addr[INET_ADDRSTRLEN];
+            strcpy(last_addr, in->waiting_addr);
             if (send_pkt(fds, in, sdr_buf, sizeof(sdr_buf)) == WRONG) {
                 return WRONG;
             }
             uint8_t rcv_buf[PKT_LBUF];
             if (recv_pkt(hope, fds, in, rcv_buf, sizeof(rcv_buf)) == WRONG) {
                 return WRONG;
+            }
+            if (strcmp(last_addr, in->waiting_addr) != 0) {
+                printf("%d %s (%s)\n", in->ttl, in->waiting_host, in->waiting_addr);
+            }
+            if (in->stop == 1) {
+                close_fds(fds);
+                return CORRECT;
             }
         }
     }

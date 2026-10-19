@@ -1,4 +1,5 @@
 #include "../hdrs/impl.h"
+#include <string.h>
 
 int
 get_addr(t_in *in)
@@ -165,21 +166,28 @@ send_pkt(int *fds, t_in *in,
 **     - Validate the ICMP response and match it to our probe.
 **     - A timeout does not mean the router does not exist.
 */
-int 
+void 
 handle_reply(struct iphdr *ip, struct icmphdr *icmp, t_in *in)
 {
-    (void)icmp;
-    //if (icmp->type == 11 && icmp->code == 0) {
-        char str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &(ip->saddr), str, sizeof(str));
-        struct hostent *host = gethostbyaddr(&ip->saddr, sizeof(ip->saddr), AF_INET);
-        if (!host) {
-            HOST_FAILED;
-            return WRONG;
-        }
-        printf("%d %s (%s)\n", in->ttl, host->h_name, str);
-    //}
-    return CORRECT;
+    int ttl_exceeded = (icmp->type == 11 && icmp->code == 0);
+    int dest_unreach  = (icmp->type == 3 && (icmp->code == 3
+                                          || icmp->code == 1
+                                          || icmp->code == 0));
+    if (!ttl_exceeded && !dest_unreach)
+        return ;
+    char tmp[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(ip->saddr), tmp, sizeof(tmp));
+    strcpy(in->waiting_addr, tmp);
+    struct hostent *host = gethostbyaddr(&ip->saddr, sizeof(ip->saddr), AF_INET);
+    if (!host) {
+        strcpy(in->waiting_host, tmp);
+    }
+    else {
+        strcpy(in->waiting_host, host->h_name);
+    }
+    if (dest_unreach) {
+        in->stop = 1;
+    }
 }
 
 int 
@@ -188,8 +196,6 @@ recv_pkt(int hope, int *fds,
                 void    *buf,
                 size_t  lbuf)
 {
-    socklen_t l = sizeof(in->iaddr);
-
     fd_set rfds;
     struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
 
@@ -201,10 +207,14 @@ recv_pkt(int hope, int *fds,
         SELECT_FAILED;
     }
     else if (ret == 0) {
+        in->cat_hops++;
+        if (in->cat_hops > MAX_HOPE) {
+            in->stop = 1;
+            return CORRECT;
+        }
         if (hope == 0) {
             fprintf(stdout, "%d * * *\n", in->ttl);
         }
-        return CORRECT;
     }
     else if (FD_ISSET(fds[1], &rfds)) {
         ssize_t r = recvfrom(
@@ -212,8 +222,8 @@ recv_pkt(int hope, int *fds,
             buf,
             lbuf,
             0, 
-            (struct sockaddr*)&in->iaddr->sin_addr.s_addr, 
-            &l);
+            NULL,
+            NULL);
         if (r < 0) {
             close_fds(fds);
             RECVFROM_FAILED;
@@ -221,7 +231,7 @@ recv_pkt(int hope, int *fds,
         }
     }
     struct iphdr *ip = (struct iphdr*)(buf);
-    struct icmphdr *icmp = (struct icmphdr*)(buf);
+    struct icmphdr *icmp = (struct icmphdr*)(buf + ip->ihl * 4);
     handle_reply(ip, icmp, in);
     return (CORRECT);
 }
