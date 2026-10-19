@@ -22,16 +22,15 @@ main(int n_args, char **args)
         return WRONG;
     }
     uint8_t sdr_buf[PKT_LBUF];
-    if (build_pkt(in, sdr_buf, sizeof(sdr_buf)) == WRONG) {
-        return WRONG;
-    }
+    size_t payload = in->lpkt - (MIN_PKT_LEN);
+    memset(sdr_buf, 0, payload);
     int fds[LFDS] = {-1, -1};
     if (opn_sock(fds) == WRONG) {
         return WRONG;
     }
     for (in->ttl = 1; in->ttl <= MAX_TTL; in->ttl++) {
         if (in->ttl == 1) {
-            TRACEROUTE_HEADER(args[1], in->saddr, HOPE, in->lpkt);
+            TRACEROUTE_HEADER(args[1], in->saddr, MAX_HOPE, in->lpkt);
         }
         if (setsockopt(fds[FD_SEND], IPPROTO_IP, IP_TTL,
                    &in->ttl, sizeof(in->ttl)) == -1) {
@@ -41,7 +40,7 @@ main(int n_args, char **args)
         for (int hope = 0; hope < HOPE; hope++) {
             char last_addr[INET_ADDRSTRLEN];
             strcpy(last_addr, in->waiting_addr);
-            if (send_pkt(fds, in, sdr_buf, sizeof(sdr_buf)) == WRONG) {
+            if (send_pkt(fds, in, sdr_buf, payload) == WRONG) {
                 return WRONG;
             }
             uint8_t rcv_buf[PKT_LBUF];

@@ -11,6 +11,7 @@
 #include <netinet/ip.h>
 #include <netdb.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 
 #define IPBUF_LEN 16
 #define DEF_PKT_LEN 60
@@ -85,6 +86,7 @@
 
 typedef struct s_in {
     struct sockaddr_in iaddr[STACK_INIT];
+    struct sockaddr_in my_iaddr[STACK_INIT];
     size_t laddr;
     char saddr[IPBUF_LEN];
     int lpkt;

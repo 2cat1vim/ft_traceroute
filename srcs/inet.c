@@ -1,5 +1,4 @@
 #include "../hdrs/impl.h"
-#include <string.h>
 
 int
 get_addr(t_in *in)
@@ -8,11 +7,9 @@ get_addr(t_in *in)
     
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
-    hints.ai_flags = AI_CANONNAME;
     hints.ai_flags |= AI_IDN;
 
-    int rc = getaddrinfo(in->saddr, NULL, &hints, &res);
-    if (rc) {
+    if (getaddrinfo(in->saddr, NULL, &hints, &res)) {
         INVALID_IPV4(in->saddr);
         return WRONG;
     }
@@ -63,21 +60,6 @@ parse_args(size_t n_args, char **args,
     else {
         in->lpkt = DEF_PKT_LEN; 
     }
-    return CORRECT;
-}
-
-int
-build_pkt(t_in *in, void *buf,
-                  size_t lbuf)
-{
-    memset(buf, 0, lbuf);
-    struct iphdr *ip = (struct iphdr *)buf;
-    ip->daddr = in->iaddr->sin_addr.s_addr;
-    ip->version = 4;
-    ip->ihl = 5;
-    ip->protocol = IPPROTO_UDP;
-    ip->ttl = MAX_TTL;
-    ip->tot_len = htons(lbuf);
     return CORRECT;
 }
 
